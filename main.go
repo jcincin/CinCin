@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"html/template"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -26,12 +26,6 @@ import (
 
 // Maximum number of log lines to keep in memory
 const maxLogLines = 500
-
-type TemplateData struct {
-	Message        string
-	RestaurantName string
-	SearchResults  []api.SearchResult
-}
 
 // Structures for JSON responses
 type SearchResponse struct {
@@ -56,13 +50,23 @@ type ReserveRequest struct {
 	PartySize        int      `json:"party_size"`
 	TablePreferences []string `json:"table_preferences"`
 	IsImmediate      bool     `json:"is_immediate"`
-	RequestTime      string   `json:"request_time"` // datetime-local format in NYC time: YYYY-MM-DDTHH:MM
+	RequestTime      string   `json:"request_time"`  // datetime-local format in NYC time: YYYY-MM-DDTHH:MM
+	AutoSchedule     bool     `json:"auto_schedule"` // If true, automatically calculate optimal run time from venue's booking window
 }
 
 type ReserveResponse struct {
 	ReservationTime string `json:"reservation_time,omitempty"`
 	ReservationID   string `json:"reservation_id,omitempty"`
+	ScheduledFor    string `json:"scheduled_for,omitempty"` // When the sniper will run (for auto_schedule)
 	Error           string `json:"error,omitempty"`
+}
+
+type BookingWindowResponse struct {
+	VenueID       int64  `json:"venue_id"`
+	DaysInAdvance int    `json:"days_in_advance"`
+	ReleaseTime   string `json:"release_time"` // e.g., "09:00"
+	Timezone      string `json:"timezone"`
+	Error         string `json:"error,omitempty"`
 }
 
 type SelectVenueRequest struct {
@@ -102,6 +106,28 @@ type HealthResponse struct {
 	Redis  string `json:"redis"`
 }
 
+// Reservation list response types
+type ReservationListResponse struct {
+	Reservations []ReservationSummary `json:"reservations"`
+	Error        string               `json:"error,omitempty"`
+}
+
+type ReservationSummary struct {
+	ID               string   `json:"id"`
+	VenueID          int64    `json:"venue_id"`
+	VenueName        string   `json:"venue_name"`
+	ReservationTime  string   `json:"reservation_time"`
+	PartySize        int      `json:"party_size"`
+	RunTime          string   `json:"run_time"`
+	CreatedAt        string   `json:"created_at"`
+	TablePreferences []string `json:"table_preferences"`
+}
+
+type CancelReservationResponse struct {
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 type AdminStatusResponse struct {
 	Venues              []VenueStatus `json:"venues"`
 	PendingReservations int64         `json:"pending_reservations"`
@@ -122,6 +148,38 @@ var logLines []string
 // NYC timezone for parsing user input times
 var nycLocation *time.Location
 
+// Venue name lookup map (loaded from venues.json)
+var venueNames map[int64]string
+
+func loadVenueNames() {
+	venueNames = make(map[int64]string)
+	data, err := os.ReadFile("venues.json")
+	if err != nil {
+		log.Printf("Warning: Could not load venues.json: %v", err)
+		return
+	}
+	var venues struct {
+		Venues []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"venues"`
+	}
+	if err := json.Unmarshal(data, &venues); err != nil {
+		log.Printf("Warning: Could not parse venues.json: %v", err)
+		return
+	}
+	for _, v := range venues.Venues {
+		venueNames[v.ID] = v.Name
+	}
+}
+
+func getVenueName(venueID int64) string {
+	if name, ok := venueNames[venueID]; ok {
+		return name
+	}
+	return fmt.Sprintf("Venue %d", venueID)
+}
+
 func init() {
 	// Load NYC timezone
 	var err error
@@ -129,6 +187,9 @@ func init() {
 	if err != nil {
 		log.Fatalf("Failed to load NYC timezone: %v", err)
 	}
+
+	// Load venue names for lookup
+	loadVenueNames()
 
 	cfg := config.Get()
 	if cfg.CookieSecretKey != nil && cfg.CookieBlockKey != nil {
@@ -144,10 +205,6 @@ func main() {
 
 	resyAPI := resy.GetDefaultAPI()
 	appCtx := app.AppCtx{API: &resyAPI}
-
-	tmpl := template.Must(template.ParseFiles("index.html", "login.html", "reserve.html"))
-
-	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 
 	// Health endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -285,11 +342,11 @@ func main() {
 			return
 		}
 
-		// Known venue IDs (could be expanded to scan Redis keys)
-		knownVenues := []int64{89607, 89678, 92807}
-		venues := make([]VenueStatus, 0, len(knownVenues))
+		// Get venue IDs from config
+		venueIDs := cfg.VenueIDs()
+		venues := make([]VenueStatus, 0, len(venueIDs))
 
-		for _, venueID := range knownVenues {
+		for _, venueID := range venueIDs {
 			status := VenueStatus{VenueID: venueID}
 			exists, _ := store.CookieExists(ctx, venueID)
 			if exists {
@@ -490,10 +547,29 @@ func main() {
 
 		var requestTime time.Time
 		if !reserveReq.IsImmediate {
-			requestTime, err = parseTimeNYC(reserveReq.RequestTime)
-			if err != nil {
-				sendJSONResponse(w, ReserveResponse{Error: "Invalid request time format. Use YYYY-MM-DDTHH:MM"}, http.StatusBadRequest)
-				return
+			if reserveReq.AutoSchedule {
+				// Auto-calculate run time from venue's booking window
+				ctx := context.Background()
+				bw, err := imperva.GetOrScrapeBookingWindow(ctx, venueID)
+				if err != nil {
+					appendLog("Failed to get booking window for venue " + strconv.FormatInt(venueID, 10) + ": " + err.Error())
+					sendJSONResponse(w, ReserveResponse{Error: "Failed to determine booking window: " + err.Error()}, http.StatusInternalServerError)
+					return
+				}
+
+				requestTime, err = bw.CalculateRunTime(reservationTime)
+				if err != nil {
+					sendJSONResponse(w, ReserveResponse{Error: "Failed to calculate run time: " + err.Error()}, http.StatusInternalServerError)
+					return
+				}
+
+				appendLog("Auto-scheduled: venue " + strconv.FormatInt(venueID, 10) + " opens " + strconv.Itoa(bw.DaysInAdvance) + " days ahead at " + strconv.Itoa(bw.ReleaseHour) + ":" + fmt.Sprintf("%02d", bw.ReleaseMinute))
+			} else {
+				requestTime, err = parseTimeNYC(reserveReq.RequestTime)
+				if err != nil {
+					sendJSONResponse(w, ReserveResponse{Error: "Invalid request time format. Use YYYY-MM-DDTHH:MM"}, http.StatusBadRequest)
+					return
+				}
 			}
 		}
 
@@ -570,57 +646,116 @@ func main() {
 			appendLog("Scheduled reservation " + resID + " for: " + requestTime.In(nycLocation).Format("2006-01-02 3:04 PM EST"))
 			sendJSONResponse(w, ReserveResponse{
 				ReservationID: resID,
+				ScheduledFor:  requestTime.In(nycLocation).Format("2006-01-02 3:04 PM EST"),
 			}, http.StatusOK)
 		}
+	})
+
+	// Booking window endpoint - get or scrape booking window for a venue
+	http.HandleFunc("/api/booking-window/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract venue ID from path: /api/booking-window/{venue_id}
+		pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/booking-window/"), "/")
+		if len(pathParts) == 0 || pathParts[0] == "" {
+			sendJSONResponse(w, BookingWindowResponse{Error: "Venue ID required"}, http.StatusBadRequest)
+			return
+		}
+
+		venueID, err := strconv.ParseInt(pathParts[0], 10, 64)
+		if err != nil {
+			sendJSONResponse(w, BookingWindowResponse{Error: "Invalid venue ID"}, http.StatusBadRequest)
+			return
+		}
+
+		ctx := context.Background()
+		bw, err := imperva.GetOrScrapeBookingWindow(ctx, venueID)
+		if err != nil {
+			appendLog("Failed to get booking window for venue " + strconv.FormatInt(venueID, 10) + ": " + err.Error())
+			sendJSONResponse(w, BookingWindowResponse{Error: "Failed to get booking window: " + err.Error()}, http.StatusInternalServerError)
+			return
+		}
+
+		sendJSONResponse(w, BookingWindowResponse{
+			VenueID:       bw.VenueID,
+			DaysInAdvance: bw.DaysInAdvance,
+			ReleaseTime:   fmt.Sprintf("%02d:%02d", bw.ReleaseHour, bw.ReleaseMinute),
+			Timezone:      bw.Timezone,
+		}, http.StatusOK)
+	})
+
+	// List all scheduled reservations
+	http.HandleFunc("/api/reservations", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx := context.Background()
+		reservations, err := store.GetAllPendingReservations(ctx)
+		if err != nil {
+			sendJSONResponse(w, ReservationListResponse{Error: "Failed to fetch reservations"}, http.StatusInternalServerError)
+			return
+		}
+
+		summaries := make([]ReservationSummary, 0, len(reservations))
+		for _, res := range reservations {
+			summaries = append(summaries, ReservationSummary{
+				ID:               res.ID,
+				VenueID:          res.VenueID,
+				VenueName:        getVenueName(res.VenueID),
+				ReservationTime:  res.ReservationTime.In(nycLocation).Format("2006-01-02 3:04 PM"),
+				PartySize:        res.PartySize,
+				RunTime:          res.RunTime.In(nycLocation).Format("2006-01-02 3:04 PM EST"),
+				CreatedAt:        res.CreatedAt.In(nycLocation).Format("2006-01-02 3:04 PM"),
+				TablePreferences: res.TablePreferences,
+			})
+		}
+
+		sendJSONResponse(w, ReservationListResponse{Reservations: summaries}, http.StatusOK)
+	})
+
+	// Cancel a scheduled reservation
+	http.HandleFunc("/api/reservations/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract reservation ID from path: /api/reservations/{id}
+		path := strings.TrimPrefix(r.URL.Path, "/api/reservations/")
+		if path == "" {
+			sendJSONResponse(w, CancelReservationResponse{Error: "Reservation ID required"}, http.StatusBadRequest)
+			return
+		}
+		resID := path
+
+		ctx := context.Background()
+
+		// Check if reservation exists
+		_, err := store.GetReservation(ctx, resID)
+		if err != nil {
+			sendJSONResponse(w, CancelReservationResponse{Error: "Reservation not found"}, http.StatusNotFound)
+			return
+		}
+
+		// Delete the reservation
+		if err := store.DeleteReservation(ctx, resID); err != nil {
+			sendJSONResponse(w, CancelReservationResponse{Error: "Failed to cancel reservation"}, http.StatusInternalServerError)
+			return
+		}
+
+		appendLog("Cancelled reservation: " + resID)
+		sendJSONResponse(w, CancelReservationResponse{Message: "Reservation cancelled"}, http.StatusOK)
 	})
 
 	// Logs endpoint
 	http.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(logLines)
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		data := TemplateData{
-			Message: "Welcome to GoResyBot Where cravings meet convenience",
-		}
-		if err := tmpl.ExecuteTemplate(w, "index.html", data); err != nil {
-			http.Error(w, "Failed to render template", http.StatusInternalServerError)
-			appendLog("Template execution error: " + err.Error())
-		}
-	})
-
-	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		data := TemplateData{}
-		if err := tmpl.ExecuteTemplate(w, "login.html", data); err != nil {
-			http.Error(w, "Failed to render template", http.StatusInternalServerError)
-			appendLog("Template execution error: " + err.Error())
-		}
-	})
-
-	http.HandleFunc("/reserve", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		_, err := getSession(r)
-		if err != nil {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-		data := TemplateData{}
-		if err := tmpl.ExecuteTemplate(w, "reserve.html", data); err != nil {
-			http.Error(w, "Failed to render template", http.StatusInternalServerError)
-			appendLog("Template execution error: " + err.Error())
-		}
 	})
 
 	// Create cancellable context for scheduler
@@ -756,9 +891,10 @@ func handleCookieRefresh(ctx context.Context, cfg *config.Config) {
 
 // refreshAllCookies checks and refreshes cookies for all known venues
 func refreshAllCookies(ctx context.Context, cfg *config.Config) {
-	appendLog("Starting cookie refresh check for " + strconv.Itoa(len(cfg.KnownVenueIDs)) + " venues")
+	venueIDs := cfg.VenueIDs()
+	appendLog("Starting cookie refresh check for " + strconv.Itoa(len(venueIDs)) + " venues")
 
-	for _, venueID := range cfg.KnownVenueIDs {
+	for _, venueID := range venueIDs {
 		select {
 		case <-ctx.Done():
 			return

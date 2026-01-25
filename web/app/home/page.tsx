@@ -1,14 +1,16 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
+import { ReservationCard, type Reservation } from "@/components/reservation-card";
+import { ReservationDetailDialog } from "@/components/reservation-detail-dialog";
 
 const RESTAURANTS = [
   { venue_id: 86907, name: "Crevette" },
-  { venue_id: 53251, name: "Opera House" },
+  { venue_id: 82039, name: "BeefBar" },
   { venue_id: 70599, name: "Forgione" },
 ];
 
@@ -28,9 +30,11 @@ export default function Home() {
 
   // Reservation form state
   const [reservationDate, setReservationDate] = useState("");
-  const [reservationTime, setReservationTime] = useState("");
+  const [reservationHour, setReservationHour] = useState("7");
+  const [reservationMinute, setReservationMinute] = useState("00");
+  const [reservationPeriod, setReservationPeriod] = useState<"AM" | "PM">("PM");
   const [tablePreferences, setTablePreferences] = useState<string[]>([]);
-  const [isImmediate, setIsImmediate] = useState(true);
+  const [scheduleMode, setScheduleMode] = useState<"immediate" | "auto" | "manual">("immediate");
   const [scheduledDate, setScheduledDate] = useState("");
   const [scheduledTime, setScheduledTime] = useState("");
 
@@ -38,6 +42,13 @@ export default function Home() {
   const [isReserving, setIsReserving] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+
+  // Reservations state
+  const [reservations, setReservations] = useState<Reservation[]>([]);
+  const [isLoadingReservations, setIsLoadingReservations] = useState(true);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
+  const [isDetailDialogOpen, setIsDetailDialogOpen] = useState(false);
 
   // Fetch logs periodically
   useEffect(() => {
@@ -58,6 +69,47 @@ export default function Home() {
     return () => clearInterval(interval);
   }, []);
 
+  // Fetch reservations function
+  const fetchReservations = useCallback(async () => {
+    try {
+      const res = await fetch("/api/reservations");
+      if (res.ok) {
+        const data = await res.json();
+        setReservations(data.reservations || []);
+      }
+    } catch {
+      // Ignore errors
+    } finally {
+      setIsLoadingReservations(false);
+    }
+  }, []);
+
+  // Fetch reservations on mount and periodically
+  useEffect(() => {
+    fetchReservations();
+    const interval = setInterval(fetchReservations, 10000);
+    return () => clearInterval(interval);
+  }, [fetchReservations]);
+
+  // Cancel reservation handler
+  const handleCancelReservation = async (id: string) => {
+    setCancellingId(id);
+    try {
+      const res = await fetch(`/api/reservations/${id}`, { method: "DELETE" });
+      if (res.ok) {
+        setReservations((prev) => prev.filter((r) => r.id !== id));
+        setMessage({ type: "success", text: "Reservation cancelled" });
+      } else {
+        const data = await res.json();
+        setMessage({ type: "error", text: data.error || "Failed to cancel" });
+      }
+    } catch {
+      setMessage({ type: "error", text: "Failed to cancel reservation" });
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
   const toggleTablePreference = (value: string) => {
     setTablePreferences((prev) =>
       prev.includes(value) ? prev.filter((p) => p !== value) : [...prev, value]
@@ -70,12 +122,12 @@ export default function Home() {
       return;
     }
 
-    if (!reservationDate || !reservationTime) {
-      setMessage({ type: "error", text: "Please select a date and time" });
+    if (!reservationDate) {
+      setMessage({ type: "error", text: "Please select a date" });
       return;
     }
 
-    if (!isImmediate && (!scheduledDate || !scheduledTime)) {
+    if (scheduleMode === "manual" && (!scheduledDate || !scheduledTime)) {
       setMessage({ type: "error", text: "Please set when to attempt the reservation" });
       return;
     }
@@ -83,8 +135,16 @@ export default function Home() {
     setIsReserving(true);
     setMessage(null);
 
+    // Convert 12-hour to 24-hour format
+    let hour24 = parseInt(reservationHour);
+    if (reservationPeriod === "AM" && hour24 === 12) {
+      hour24 = 0;
+    } else if (reservationPeriod === "PM" && hour24 !== 12) {
+      hour24 += 12;
+    }
+    const reservationTime = `${hour24.toString().padStart(2, "0")}:${reservationMinute}`;
     const reservationDateTime = `${reservationDate}T${reservationTime}`;
-    const requestDateTime = isImmediate ? "" : `${scheduledDate}T${scheduledTime}`;
+    const requestDateTime = scheduleMode === "manual" ? `${scheduledDate}T${scheduledTime}` : "";
 
     try {
       const res = await fetch("/api/reserve", {
@@ -95,7 +155,8 @@ export default function Home() {
           reservation_time: reservationDateTime,
           party_size: 2,
           table_preferences: tablePreferences,
-          is_immediate: isImmediate,
+          is_immediate: scheduleMode === "immediate",
+          auto_schedule: scheduleMode === "auto",
           request_time: requestDateTime,
         }),
       });
@@ -107,7 +168,9 @@ export default function Home() {
       } else if (data.reservation_time) {
         setMessage({ type: "success", text: `Reserved for ${data.reservation_time}` });
       } else if (data.reservation_id) {
-        setMessage({ type: "success", text: `Scheduled! ID: ${data.reservation_id}` });
+        // Refresh reservations list to show the new one
+        await fetchReservations();
+        setMessage({ type: "success", text: "Reservation scheduled!" });
       }
     } catch {
       setMessage({ type: "error", text: "Failed to make reservation" });
@@ -200,12 +263,34 @@ export default function Home() {
               </div>
               <div className="space-y-2">
                 <Label className="text-zinc-400 text-sm">Reservation Time</Label>
-                <Input
-                  type="time"
-                  value={reservationTime}
-                  onChange={(e) => setReservationTime(e.target.value)}
-                  className="bg-zinc-800 border-zinc-700 text-white"
-                />
+                <div className="flex gap-2">
+                  <select
+                    value={reservationHour}
+                    onChange={(e) => setReservationHour(e.target.value)}
+                    className="flex-1 h-10 rounded-md bg-zinc-800 border border-zinc-700 text-white px-3 text-sm appearance-none cursor-pointer"
+                  >
+                    {[12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((h) => (
+                      <option key={h} value={h}>{h}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={reservationMinute}
+                    onChange={(e) => setReservationMinute(e.target.value)}
+                    className="flex-1 h-10 rounded-md bg-zinc-800 border border-zinc-700 text-white px-3 text-sm appearance-none cursor-pointer"
+                  >
+                    {["00", "15", "30", "45"].map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={reservationPeriod}
+                    onChange={(e) => setReservationPeriod(e.target.value as "AM" | "PM")}
+                    className="w-20 h-10 rounded-md bg-zinc-800 border border-zinc-700 text-white px-3 text-sm appearance-none cursor-pointer"
+                  >
+                    <option value="AM">AM</option>
+                    <option value="PM">PM</option>
+                  </select>
+                </div>
               </div>
             </div>
 
@@ -237,31 +322,51 @@ export default function Home() {
 
             {/* Timing Toggle */}
             <div className="space-y-4">
+              <Label className="text-zinc-400 text-sm">Booking Mode</Label>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => setIsImmediate(true)}
+                  onClick={() => setScheduleMode("immediate")}
                   className={`flex-1 py-3 rounded-lg text-sm font-medium transition-colors ${
-                    isImmediate
+                    scheduleMode === "immediate"
                       ? "bg-amber-400 text-black"
                       : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
                   }`}
                 >
-                  Reserve Immediately
+                  Now
                 </button>
                 <button
-                  onClick={() => setIsImmediate(false)}
+                  onClick={() => setScheduleMode("auto")}
                   className={`flex-1 py-3 rounded-lg text-sm font-medium transition-colors ${
-                    !isImmediate
+                    scheduleMode === "auto"
                       ? "bg-amber-400 text-black"
                       : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
                   }`}
                 >
-                  Schedule for Later
+                  Auto Snipe
+                </button>
+                <button
+                  onClick={() => setScheduleMode("manual")}
+                  className={`flex-1 py-3 rounded-lg text-sm font-medium transition-colors ${
+                    scheduleMode === "manual"
+                      ? "bg-amber-400 text-black"
+                      : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                  }`}
+                >
+                  Manual
                 </button>
               </div>
 
-              {/* Scheduled Time (if not immediate) */}
-              {!isImmediate && (
+              {/* Auto Schedule Info */}
+              {scheduleMode === "auto" && (
+                <div className="p-4 bg-zinc-800/50 rounded-lg">
+                  <p className="text-xs text-zinc-400">
+                    Auto Snipe will detect when reservations open for this restaurant and schedule the booking attempt automatically.
+                  </p>
+                </div>
+              )}
+
+              {/* Manual Schedule (custom date/time) */}
+              {scheduleMode === "manual" && (
                 <div className="grid grid-cols-2 gap-4 p-4 bg-zinc-800/50 rounded-lg">
                   <div className="space-y-2">
                     <Label className="text-zinc-400 text-sm">Attempt On Date</Label>
@@ -294,7 +399,13 @@ export default function Home() {
               disabled={isReserving || !selectedVenueId}
               className="w-full py-6 text-lg bg-amber-400 text-black hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isReserving ? "RESERVING..." : isImmediate ? "RESERVE" : "SCHEDULE RESERVATION"}
+              {isReserving
+                ? "RESERVING..."
+                : scheduleMode === "immediate"
+                ? "RESERVE NOW"
+                : scheduleMode === "auto"
+                ? "AUTO SNIPE"
+                : "SCHEDULE"}
             </Button>
 
             {!selectedVenueId && (
@@ -304,7 +415,44 @@ export default function Home() {
             )}
           </CardContent>
         </Card>
+
+        {/* Scheduled Reservations Section */}
+        {!isLoadingReservations && reservations.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-amber-400 text-xl font-light tracking-wider text-center mb-4">
+              SCHEDULED RESERVATIONS
+            </h2>
+            <div className="space-y-3">
+              {reservations.map((reservation) => (
+                <ReservationCard
+                  key={reservation.id}
+                  reservation={reservation}
+                  onView={() => {
+                    setSelectedReservation(reservation);
+                    setIsDetailDialogOpen(true);
+                  }}
+                  onCancel={() => handleCancelReservation(reservation.id)}
+                  isCancelling={cancellingId === reservation.id}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!isLoadingReservations && reservations.length === 0 && (
+          <div className="mt-8 text-center text-zinc-500 text-sm">
+            No scheduled reservations
+          </div>
+        )}
       </div>
+
+      {/* Reservation Detail Dialog */}
+      <ReservationDetailDialog
+        reservation={selectedReservation}
+        open={isDetailDialogOpen}
+        onOpenChange={setIsDetailDialogOpen}
+      />
     </div>
     </>
   );

@@ -42,9 +42,8 @@ ENV CHROME_BIN=/usr/bin/chromium-browser
 # Copy the binary from builder
 COPY --from=builder /app/resy_bot .
 
-# Copy HTML templates and static files
-COPY --from=builder /app/*.html ./
-COPY --from=builder /app/static ./static
+# Copy venue configuration
+COPY --from=builder /app/venues.json ./
 
 # Create a non-root user and give it access to chrome sandbox
 RUN adduser -D -g '' appuser && \

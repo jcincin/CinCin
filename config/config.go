@@ -2,11 +2,25 @@ package config
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"log"
 	"os"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// Venue represents a restaurant venue
+type Venue struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+// venuesFile represents the structure of venues.json
+type venuesFile struct {
+	Venues []Venue `json:"venues"`
+}
 
 // Config holds all configuration values
 type Config struct {
@@ -19,7 +33,7 @@ type Config struct {
 	AdminToken            string
 	CookieRefreshEnabled  bool
 	CookieRefreshInterval time.Duration
-	KnownVenueIDs         []int64
+	Venues                []Venue
 }
 
 var (
@@ -40,10 +54,39 @@ func Get() *Config {
 			AdminToken:            getEnv("ADMIN_TOKEN", ""),
 			CookieRefreshEnabled:  getEnvBool("COOKIE_REFRESH_ENABLED", true),
 			CookieRefreshInterval: getEnvDuration("COOKIE_REFRESH_INTERVAL", 6*time.Hour),
-			KnownVenueIDs:         []int64{89607, 89678, 92807},
+			Venues:                loadVenues(),
 		}
 	})
 	return cfg
+}
+
+// loadVenues reads venues from venues.json file
+func loadVenues() []Venue {
+	venuesPath := getEnv("VENUES_FILE", "venues.json")
+
+	data, err := os.ReadFile(venuesPath)
+	if err != nil {
+		log.Printf("Warning: Could not read venues file %s: %v", venuesPath, err)
+		return []Venue{}
+	}
+
+	var vf venuesFile
+	if err := json.Unmarshal(data, &vf); err != nil {
+		log.Printf("Warning: Could not parse venues file %s: %v", venuesPath, err)
+		return []Venue{}
+	}
+
+	log.Printf("Loaded %d venues from %s", len(vf.Venues), venuesPath)
+	return vf.Venues
+}
+
+// VenueIDs returns a slice of venue IDs for backward compatibility
+func (c *Config) VenueIDs() []int64 {
+	ids := make([]int64, len(c.Venues))
+	for i, v := range c.Venues {
+		ids[i] = v.ID
+	}
+	return ids
 }
 
 // getEnv returns the environment variable value or a default

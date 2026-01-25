@@ -16,6 +16,10 @@ var (
 
 // GetClient returns the singleton Redis client
 func GetClient() *redis.Client {
+	// If client was set externally (e.g., for testing), use it
+	if client != nil {
+		return client
+	}
 	once.Do(func() {
 		redisURL := os.Getenv("REDIS_URL")
 		if redisURL == "" {
@@ -44,6 +48,17 @@ func Close() error {
 		return client.Close()
 	}
 	return nil
+}
+
+// SetClient sets a custom Redis client (for testing)
+func SetClient(c *redis.Client) {
+	client = c
+}
+
+// ResetClient resets the client singleton (for testing)
+func ResetClient() {
+	client = nil
+	once = sync.Once{}
 }
 
 // Key prefixes

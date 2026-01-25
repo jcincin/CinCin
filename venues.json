@@ -1,0 +1,7 @@
+{
+  "venues": [
+    {"id": 86907, "name": "Crevette", "slug": "crevette"},
+    {"id": 82039, "name": "BeefBar", "slug": "beefbar"},
+    {"id": 70599, "name": "Forgione", "slug": "forgione"}
+  ]
+}

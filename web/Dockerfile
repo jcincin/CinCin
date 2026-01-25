@@ -1,19 +1,20 @@
-# Build stage
-FROM node:20-alpine AS builder
+# Build stage - use official Bun image
+FROM oven/bun:1 AS builder
 
 WORKDIR /app
 
 # Copy package files
-COPY package.json package-lock.json ./
+COPY package.json ./
+COPY bun.lock* ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (delete lockfile to get correct platform binaries)
+RUN rm -f bun.lock && bun install
 
 # Copy source code
 COPY . .
 
 # Build the Next.js app
-RUN npm run build
+RUN bun run build
 
 # Runtime stage
 FROM node:20-alpine AS runner
