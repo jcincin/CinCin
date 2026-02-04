@@ -5,7 +5,7 @@ import { api } from "@/convex/_generated/api";
 
 let _stripe: Stripe;
 function getStripe() {
-  if (!_stripe) _stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2025-12-15.clover" });
+  if (!_stripe) _stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
   return _stripe;
 }
 
