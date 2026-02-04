@@ -4,8 +4,17 @@ import { Resend } from "resend";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _resend: Resend;
+function getResend() {
+  if (!_resend) _resend = new Resend(process.env.RESEND_API_KEY);
+  return _resend;
+}
+
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 function createSignedUrl(action: string, email: string, firstName: string): string {
   const secret = process.env.ADMIN_TOKEN!;
@@ -46,7 +55,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Send email to boss
-    const { error } = await resend.emails.send({
+    const { error } = await getResend().emails.send({
       from: "Cin Cin <applications@cincin.vip>",
       to: bossEmail,
       subject: `New Application: ${body.firstName} ${body.lastName}`,
@@ -120,7 +129,7 @@ export async function POST(request: NextRequest) {
 
     // Store application in Convex
     try {
-      await convex.mutation(api.applications.createApplication, {
+      await getConvex().mutation(api.applications.createApplication, {
         email: body.email,
         firstName: body.firstName,
         lastName: body.lastName,

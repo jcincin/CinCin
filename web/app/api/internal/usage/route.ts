@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 type UsageType = "immediate" | "concierge";
 
@@ -42,7 +46,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const user = await convex.query(api.users.getUserByClerkId, {
+    const user = await getConvex().query(api.users.getUserByClerkId, {
       clerkId: body.clerkUserId,
     });
 
@@ -50,7 +54,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
-    await convex.mutation(api.usage.incrementUsage, {
+    await getConvex().mutation(api.usage.incrementUsage, {
       userId: user._id,
       type: body.type,
     });

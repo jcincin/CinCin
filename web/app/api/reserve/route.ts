@@ -3,7 +3,11 @@ import { auth } from "@clerk/nextjs/server";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 export async function POST(request: NextRequest) {
   const { userId } = await auth();
@@ -25,7 +29,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
 
-    const convexUser = await convex.query(api.users.getUserByClerkId, {
+    const convexUser = await getConvex().query(api.users.getUserByClerkId, {
       clerkId: userId,
     });
 
@@ -34,7 +38,7 @@ export async function POST(request: NextRequest) {
     }
 
     const usageType = body?.auto_schedule ? "concierge" : "immediate";
-    const usageCheck = await convex.query(api.usage.checkCanBook, {
+    const usageCheck = await getConvex().query(api.usage.checkCanBook, {
       userId: convexUser._id,
       type: usageType,
     });
@@ -73,7 +77,7 @@ export async function POST(request: NextRequest) {
 
     if (response.ok && data?.reservation_time) {
       try {
-        await convex.mutation(api.usage.incrementUsage, {
+        await getConvex().mutation(api.usage.incrementUsage, {
           userId: convexUser._id,
           type: usageType,
         });

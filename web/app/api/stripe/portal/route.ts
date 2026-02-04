@@ -4,11 +4,17 @@ import Stripe from "stripe";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2026-01-28.clover",
-});
+let _stripe: Stripe;
+function getStripe() {
+  if (!_stripe) _stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: "2025-12-15.clover" });
+  return _stripe;
+}
 
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 export async function POST() {
   try {
@@ -19,7 +25,7 @@ export async function POST() {
     }
 
     // Get user from Convex
-    const user = await convex.query(api.users.getUserByClerkId, {
+    const user = await getConvex().query(api.users.getUserByClerkId, {
       clerkId: userId,
     });
 
@@ -28,7 +34,7 @@ export async function POST() {
     }
 
     // Get subscription from Convex
-    const subscription = await convex.query(
+    const subscription = await getConvex().query(
       api.subscriptions.getSubscriptionByUserId,
       { userId: user._id }
     );
@@ -43,7 +49,7 @@ export async function POST() {
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
     // Create Stripe billing portal session
-    const session = await stripe.billingPortal.sessions.create({
+    const session = await getStripe().billingPortal.sessions.create({
       customer: subscription.stripeCustomerId,
       return_url: `${appUrl}/home`,
     });

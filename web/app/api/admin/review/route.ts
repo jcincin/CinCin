@@ -4,8 +4,17 @@ import { Resend } from "resend";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _resend: Resend;
+function getResend() {
+  if (!_resend) _resend = new Resend(process.env.RESEND_API_KEY);
+  return _resend;
+}
+
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 function verifySignature(action: string, email: string, firstName: string, sig: string): boolean {
   const secret = process.env.ADMIN_TOKEN;
@@ -62,7 +71,7 @@ export async function GET(request: NextRequest) {
       const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
       const signUpUrl = `${appUrl}/sign-up?email=${encodeURIComponent(email)}`;
 
-      const { error } = await resend.emails.send({
+      const { error } = await getResend().emails.send({
         from: "Cin Cin <applications@cincin.vip>",
         to: email,
         subject: "You're In - Complete Your Cin Cin Membership",
@@ -107,7 +116,7 @@ export async function GET(request: NextRequest) {
       }
 
       try {
-        await convex.mutation(api.applications.approveApplication, { email });
+        await getConvex().mutation(api.applications.approveApplication, { email });
       } catch (convexError) {
         console.error("Convex error:", convexError);
       }
@@ -115,7 +124,7 @@ export async function GET(request: NextRequest) {
       return htmlPage("APPROVED", `${firstName}'s application has been approved and their invitation email has been sent.`, true);
     } else {
       try {
-        await convex.mutation(api.applications.rejectApplication, { email });
+        await getConvex().mutation(api.applications.rejectApplication, { email });
       } catch (convexError) {
         console.error("Convex error:", convexError);
       }

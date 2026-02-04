@@ -3,8 +3,17 @@ import { Resend } from "resend";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "@/convex/_generated/api";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
-const convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+let _resend: Resend;
+function getResend() {
+  if (!_resend) _resend = new Resend(process.env.RESEND_API_KEY);
+  return _resend;
+}
+
+let _convex: ConvexHttpClient;
+function getConvex() {
+  if (!_convex) _convex = new ConvexHttpClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
+  return _convex;
+}
 
 interface ApproveRequest {
   email: string;
@@ -34,7 +43,7 @@ export async function POST(request: NextRequest) {
     const signUpUrl = `${appUrl}/sign-up?email=${encodeURIComponent(body.email)}`;
 
     // Send approval email to applicant
-    const { error } = await resend.emails.send({
+    const { error } = await getResend().emails.send({
       from: "Cin Cin <applications@cincin.vip>",
       to: body.email,
       subject: "You're In - Complete Your Cin Cin Membership",
@@ -83,7 +92,7 @@ export async function POST(request: NextRequest) {
 
     // Update application status in Convex
     try {
-      await convex.mutation(api.applications.approveApplication, {
+      await getConvex().mutation(api.applications.approveApplication, {
         email: body.email,
       });
     } catch (convexError) {
