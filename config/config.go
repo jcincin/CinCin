@@ -27,13 +27,17 @@ type Config struct {
 	RedisURL              string
 	RedisPassword         string
 	ResyAPIKey            string
+	ResyCredentialsKey    []byte
 	CookieSecretKey       []byte
 	CookieBlockKey        []byte
 	Port                  string
 	AdminToken            string
+	InternalAPIToken      string
+	DevAdminToken         string
 	CookieRefreshEnabled  bool
 	CookieRefreshInterval time.Duration
 	Venues                []Venue
+	WebAppURL             string
 }
 
 var (
@@ -48,13 +52,17 @@ func Get() *Config {
 			RedisURL:              getEnv("REDIS_URL", "localhost:6379"),
 			RedisPassword:         getEnv("REDIS_PASSWORD", ""),
 			ResyAPIKey:            getEnv("RESY_API_KEY", "VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5"),
+			ResyCredentialsKey:    getSecretKey("RESY_CREDENTIALS_KEY"),
 			CookieSecretKey:       getSecretKey("COOKIE_SECRET_KEY"),
 			CookieBlockKey:        getSecretKey("COOKIE_BLOCK_KEY"),
 			Port:                  getEnv("PORT", "8090"),
 			AdminToken:            getEnv("ADMIN_TOKEN", ""),
+			InternalAPIToken:      getEnv("INTERNAL_API_TOKEN", ""),
+			DevAdminToken:         getEnv("DEV_ADMIN_TOKEN", ""),
 			CookieRefreshEnabled:  getEnvBool("COOKIE_REFRESH_ENABLED", true),
 			CookieRefreshInterval: getEnvDuration("COOKIE_REFRESH_INTERVAL", 6*time.Hour),
 			Venues:                loadVenues(),
+			WebAppURL:             getEnv("NEXT_PUBLIC_APP_URL", "http://localhost:3000"),
 		}
 	})
 	return cfg
@@ -146,10 +154,23 @@ func (c *Config) HasAdminToken() bool {
 	return c.AdminToken != ""
 }
 
+// HasDevAdminToken returns true if a dev admin token is configured
+func (c *Config) HasDevAdminToken() bool {
+	return c.DevAdminToken != ""
+}
+
 // ValidateAdminToken checks if the provided token matches the configured admin token
 func (c *Config) ValidateAdminToken(token string) bool {
 	if !c.HasAdminToken() {
 		return false // No admin token configured, deny all
 	}
 	return token == c.AdminToken
+}
+
+// ValidateDevAdminToken checks if the provided token matches the configured dev admin token
+func (c *Config) ValidateDevAdminToken(token string) bool {
+	if !c.HasDevAdminToken() {
+		return false
+	}
+	return token == c.DevAdminToken
 }

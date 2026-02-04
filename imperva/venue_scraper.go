@@ -45,20 +45,10 @@ func ScrapeBookingWindowWithRetry(venueID int64, maxRetries int) (*store.Booking
 
 // scrapeBookingWindowOnce performs a single scrape attempt
 func scrapeBookingWindowOnce(venueID int64) (*store.BookingWindow, error) {
-	slug := resolveVenueSlug(venueID)
-	venueURL := fmt.Sprintf("https://resy.com/cities/ny/venues/%d", venueID)
-	if slug != "" {
-		venueURL = fmt.Sprintf("https://resy.com/cities/ny/%s", slug)
-	} else {
-		// #region agent log
-		appendDebugLog("A", "imperva/venue_scraper.go:scrapeBookingWindowOnce", "venue slug missing; using fallback URL", map[string]interface{}{
-			"venue_id": venueID,
-		})
-		// #endregion agent log
-	}
+	venueURL := FetchCookiesVenueURL(venueID)
 	// #region agent log
 	appendDebugLog("A", "imperva/venue_scraper.go:scrapeBookingWindowOnce", "constructed venue URL", map[string]interface{}{
-		"venue_id": venueID,
+		"venue_id":  venueID,
 		"venue_url": venueURL,
 	})
 	// #endregion agent log
@@ -112,9 +102,9 @@ func scrapeBookingWindowOnce(venueID int64) (*store.BookingWindow, error) {
 	}
 	// #region agent log
 	appendDebugLog("E", "imperva/venue_scraper.go:scrapeBookingWindowOnce", "html content markers", map[string]interface{}{
-		"contains_next_data": strings.Contains(pageHTML, "__NEXT_DATA__"),
+		"contains_next_data":   strings.Contains(pageHTML, "__NEXT_DATA__"),
 		"contains_days_phrase": strings.Contains(htmlLower, "days in advance"),
-		"bot_indicators": foundIndicators,
+		"bot_indicators":       foundIndicators,
 	})
 	// #endregion agent log
 
@@ -172,10 +162,10 @@ func parseNextData(venueID int64, jsonStr string) (*store.BookingWindow, error) 
 	if bw.DaysInAdvance == 0 {
 		// #region agent log
 		appendDebugLog("C", "imperva/venue_scraper.go:parseNextData", "days_in_advance missing in next data", map[string]interface{}{
-			"venue_id":        venueID,
-			"top_level_keys":  len(data),
-			"release_hour":    bw.ReleaseHour,
-			"release_minute":  bw.ReleaseMinute,
+			"venue_id":       venueID,
+			"top_level_keys": len(data),
+			"release_hour":   bw.ReleaseHour,
+			"release_minute": bw.ReleaseMinute,
 		})
 		// #endregion agent log
 		return nil, fmt.Errorf("could not find days_in_advance in JSON")
@@ -280,7 +270,7 @@ func parseHTMLContent(venueID int64, html string) (*store.BookingWindow, error) 
 	bw := &store.BookingWindow{
 		VenueID:       venueID,
 		Timezone:      "America/New_York",
-		ReleaseHour:   9,  // Default to 9 AM if not found
+		ReleaseHour:   9, // Default to 9 AM if not found
 		ReleaseMinute: 0,
 		ScrapedAt:     time.Now().UTC(),
 	}
@@ -360,6 +350,10 @@ func resolveVenueSlug(venueID int64) string {
 }
 
 func appendDebugLog(hypothesisId, location, message string, data map[string]interface{}) {
+	logPath := os.Getenv("DEBUG_LOG_PATH")
+	if logPath == "" {
+		return
+	}
 	payload := map[string]interface{}{
 		"sessionId":    "debug-session",
 		"runId":        "pre-fix",
@@ -373,7 +367,7 @@ func appendDebugLog(hypothesisId, location, message string, data map[string]inte
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile("/Users/josephwilliams/Desktop/Dev/resy_bot/.cursor/debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}

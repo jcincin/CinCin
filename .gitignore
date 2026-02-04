@@ -15,6 +15,7 @@ build/
 # Go
 gopath/
 *.exe
+resy_bot
 
 # OS files
 .DS_Store
@@ -35,3 +36,8 @@ package-lock.json
 
 # Local planning docs
 PLAN.md
+
+# Claude AI files
+CLAUDE.md
+CLAUDE_*.md
+*.claude.md

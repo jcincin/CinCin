@@ -2,6 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 
 export async function POST(request: NextRequest) {
   const apiUrl = process.env.API_URL || "http://localhost:8090";
+  const internalToken = process.env.INTERNAL_API_TOKEN;
+
+  if (!internalToken) {
+    return NextResponse.json(
+      { error: "Server configuration error" },
+      { status: 500 }
+    );
+  }
   
   try {
     const body = await request.json();
@@ -13,6 +21,7 @@ export async function POST(request: NextRequest) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "X-Internal-Token": internalToken,
         ...(cookieHeader && { Cookie: cookieHeader }),
       },
       body: JSON.stringify(body),

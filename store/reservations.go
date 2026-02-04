@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,7 +18,10 @@ type ScheduledReservation struct {
 	PartySize        int       `json:"party_size"`
 	TablePreferences []string  `json:"table_preferences"`
 	AuthToken        string    `json:"auth_token"`
-	RunTime          time.Time `json:"run_time"` // When to attempt the reservation
+	PaymentMethodID  int64     `json:"payment_method_id,omitempty"`
+	ClerkUserID      string    `json:"clerk_user_id,omitempty"` // Clerk user ID for credential lookup
+	UsageType        string    `json:"usage_type,omitempty"`    // "immediate" or "concierge"
+	RunTime          time.Time `json:"run_time"`                // When to attempt the reservation
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -96,17 +100,30 @@ func GetPendingReservations(ctx context.Context) ([]*ScheduledReservation, error
 
 // GetNextReservation returns the earliest pending reservation
 func GetNextReservation(ctx context.Context) (*ScheduledReservation, error) {
-	// Get the first (earliest) reservation ID from the sorted set
-	ids, err := GetClient().ZRange(ctx, PendingSetKey, 0, 0).Result()
-	if err != nil {
+	for {
+		// Get the first (earliest) reservation ID from the sorted set
+		ids, err := GetClient().ZRange(ctx, PendingSetKey, 0, 0).Result()
+		if err != nil {
+			return nil, err
+		}
+
+		if len(ids) == 0 {
+			return nil, nil // No pending reservations
+		}
+
+		res, err := GetReservation(ctx, ids[0])
+		if err == nil {
+			return res, nil
+		}
+
+		if errors.Is(err, redis.Nil) {
+			// Stale sorted-set entry without payload, remove and retry
+			_ = GetClient().ZRem(ctx, PendingSetKey, ids[0]).Err()
+			continue
+		}
+
 		return nil, err
 	}
-
-	if len(ids) == 0 {
-		return nil, nil // No pending reservations
-	}
-
-	return GetReservation(ctx, ids[0])
 }
 
 // GetAllPendingReservations returns all scheduled reservations (for status endpoint)
@@ -137,6 +154,29 @@ func CountPendingReservations(ctx context.Context) (int64, error) {
 // GenerateReservationID creates a unique ID for a reservation
 func GenerateReservationID() string {
 	return fmt.Sprintf("res_%d", time.Now().UnixNano())
+}
+
+// GetReservationsByClerkUser returns all reservations for a specific Clerk user
+func GetReservationsByClerkUser(ctx context.Context, clerkUserID string) ([]*ScheduledReservation, error) {
+	// Get all reservation IDs from the sorted set
+	ids, err := GetClient().ZRange(ctx, PendingSetKey, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	reservations := make([]*ScheduledReservation, 0)
+	for _, id := range ids {
+		res, err := GetReservation(ctx, id)
+		if err != nil {
+			continue
+		}
+		// Filter by Clerk user ID
+		if res.ClerkUserID == clerkUserID {
+			reservations = append(reservations, res)
+		}
+	}
+
+	return reservations, nil
 }
 
 

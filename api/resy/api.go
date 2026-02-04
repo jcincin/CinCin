@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -79,6 +80,13 @@ func min(a, b int) int {
 	return b
 }
 
+func truncateForLog(body []byte, max int) string {
+	if len(body) <= max {
+		return string(body)
+	}
+	return string(body[:max]) + "..."
+}
+
 /*
 Name: SetCookies
 Type: API Func
@@ -121,7 +129,7 @@ Purpose: Extract cookies from HTTP response headers and update API client cookie
 func (a *API) extractCookiesFromResponse(resp *http.Response) {
 	// Check if this is an Imperva response
 	if resp.Header.Get("X-Cdn") == "Imperva" || resp.Header.Get("Server") == "nginx" {
-		fmt.Println("Detected Imperva challenge response, extracting cookies...")
+		log.Printf("Imperva challenge detected, extracting cookies")
 
 		// Parse Set-Cookie headers
 		for _, cookieStr := range resp.Header.Values("Set-Cookie") {
@@ -179,15 +187,13 @@ func (a *API) extractCookiesFromResponse(resp *http.Response) {
 						if !found {
 							a.Cookies = append(a.Cookies, cookie)
 						}
-
-						fmt.Printf("Extracted Imperva cookie: %s\n", cookie.Name)
 					}
 				}
 			}
 		}
 
 		if len(a.Cookies) > 0 {
-			fmt.Printf("Updated API client with %d Imperva cookies from challenge response\n", len(a.Cookies))
+			log.Printf("Updated cookies from Imperva response: %d cookies", len(a.Cookies))
 		}
 	}
 }
@@ -234,7 +240,7 @@ func (a *API) doRequestWithRetry(client *http.Client, req *http.Request, bodyByt
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		// On retry, recreate the request with the body
 		if attempt > 0 {
-			fmt.Printf("Retrying request (attempt %d/%d) with updated cookies...\n", attempt+1, maxRetries+1)
+			log.Printf("Retry %d/%d with updated cookies", attempt+1, maxRetries+1)
 
 			// Recreate request with body for POST requests
 			if bodyBytes != nil {
@@ -266,7 +272,7 @@ func (a *API) doRequestWithRetry(client *http.Client, req *http.Request, bodyByt
 
 		// Check if this is an Imperva challenge
 		if isImpervaChallenge(resp) {
-			fmt.Printf("Received Imperva challenge (status %d), extracting cookies and retrying...\n", resp.StatusCode)
+			log.Printf("Imperva challenge (status %d), retrying", resp.StatusCode)
 			lastImpervaResponse = true
 
 			// Extract cookies from response
@@ -279,7 +285,7 @@ func (a *API) doRequestWithRetry(client *http.Client, req *http.Request, bodyByt
 			} else {
 				// Retries exhausted - return ErrImperva
 				resp.Body.Close()
-				fmt.Println("Retries exhausted, Imperva challenge not resolved. Please refresh cookies via /admin/cookies/import")
+				log.Printf("Imperva challenge unresolved after %d retries", maxRetries+1)
 				return nil, api.ErrImperva
 			}
 		}
@@ -306,7 +312,7 @@ func (a *API) LoadCookiesFromStore(venueID int64) error {
 		return err
 	}
 	a.SetCookies(cookieData.Cookies, cookieData.UserAgent)
-	fmt.Printf("Loaded %d cookies from store for venue %d\n", len(cookieData.Cookies), venueID)
+	log.Printf("Loaded %d cookies for venue %d", len(cookieData.Cookies), venueID)
 	return nil
 }
 
@@ -354,6 +360,8 @@ func (a *API) Login(params api.LoginParam) (*api.LoginResponse, error) {
 		return nil, err
 	}
 
+	defer response.Body.Close()
+
 	// Resy servers return a 419 is the auth parameters were invalid
 	if response.StatusCode == 419 {
 		return nil, api.ErrLoginWrong
@@ -362,8 +370,6 @@ func (a *API) Login(params api.LoginParam) (*api.LoginResponse, error) {
 	if isCodeFail(response.StatusCode) {
 		return nil, api.ErrNetwork
 	}
-
-	defer response.Body.Close()
 
 	responseBody, err := io.ReadAll(response.Body)
 
@@ -430,7 +436,7 @@ func (a *API) Search(params api.SearchParam) (*api.SearchResponse, error) {
 
 	if isCodeFail(response.StatusCode) {
 		responseBody, _ := io.ReadAll(response.Body)
-		fmt.Printf("Search request failed with status code: %d, body: %s\n", response.StatusCode, string(responseBody))
+		log.Printf("Search failed: status %d, body: %s", response.StatusCode, truncateForLog(responseBody, 200))
 		return nil, api.ErrNetwork
 	}
 
@@ -442,33 +448,33 @@ func (a *API) Search(params api.SearchParam) (*api.SearchResponse, error) {
 	var jsonTopLevelMap map[string]interface{}
 	err = json.Unmarshal(responseBody, &jsonTopLevelMap)
 	if err != nil {
-		fmt.Printf("Error unmarshaling search response: %v, body: %s\n", err, string(responseBody))
+		log.Printf("Search unmarshal error: %v", err)
 		return nil, err
 	}
 
 	// Check if "search" key exists
 	searchValue, ok := jsonTopLevelMap["search"]
 	if !ok {
-		fmt.Printf("Search response missing 'search' key. Response: %s\n", string(responseBody))
+		log.Printf("Search response missing 'search' key")
 		return nil, api.ErrNetwork
 	}
 
 	jsonSearchMap, ok := searchValue.(map[string]interface{})
 	if !ok {
-		fmt.Printf("Search response 'search' is not a map. Response: %s\n", string(responseBody))
+		log.Printf("Search response 'search' is not a map")
 		return nil, api.ErrNetwork
 	}
 
 	// Check if "hits" key exists
 	hitsValue, ok := jsonSearchMap["hits"]
 	if !ok {
-		fmt.Printf("Search response missing 'hits' key. Response: %s\n", string(responseBody))
+		log.Printf("Search response missing 'hits' key")
 		return nil, api.ErrNetwork
 	}
 
 	jsonHitsMap, ok := hitsValue.([]interface{})
 	if !ok {
-		fmt.Printf("Search response 'hits' is not an array. Response: %s\n", string(responseBody))
+		log.Printf("Search response 'hits' is not an array")
 		return nil, api.ErrNetwork
 	}
 
@@ -486,20 +492,17 @@ func (a *API) Search(params api.SearchParam) (*api.SearchResponse, error) {
 	for i := 0; i < limit; i++ {
 		jsonHitMap, ok := jsonHitsMap[i].(map[string]interface{})
 		if !ok {
-			fmt.Printf("Hit %d is not a map, skipping\n", i)
 			continue
 		}
 
 		// Safely extract fields with nil checks
 		objectID, ok := jsonHitMap["objectID"].(string)
 		if !ok {
-			fmt.Printf("Hit %d missing or invalid objectID, skipping\n", i)
 			continue
 		}
 
 		venueID, err := strconv.ParseInt(objectID, 10, 64)
 		if err != nil {
-			fmt.Printf("Error parsing venueID %s: %v, skipping\n", objectID, err)
 			continue
 		}
 
@@ -530,26 +533,24 @@ Type: API Func
 Purpose: Resy implementation of the Reserve api func
 */
 func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
-	fmt.Println("Starting Reserve function")
-	defer fmt.Println("Exiting Reserve function")
+	if len(params.ReservationTimes) == 0 {
+		return nil, api.ErrTimeNull
+	}
 
 	// Try to load cookies from Redis store for this venue
 	if err := a.LoadCookiesFromStore(params.VenueID); err != nil {
-		fmt.Printf("Warning: Could not load cookies from store for venue %d: %v\n", params.VenueID, err)
+		log.Printf("Warning: cookies not found for venue %d: %v", params.VenueID, err)
 		// Continue anyway - cookies might have been set manually or we'll get Imperva error
 	}
 
 	// Converting fields to URL query format
 	// IMPORTANT: Convert to NYC timezone before extracting date components
 	// The reservation time is stored in UTC, but Resy expects the date in NYC timezone
-	fmt.Println("Converting reservation times to date string")
 	nycLocation, err := time.LoadLocation("America/New_York")
 	if err != nil {
-		fmt.Printf("Error loading NYC timezone: %v, using UTC\n", err)
 		nycLocation = time.UTC
 	}
 	reservationTimeNYC := params.ReservationTimes[0].In(nycLocation)
-	fmt.Printf("Reservation time in NYC: %s\n", reservationTimeNYC.Format("2006-01-02 15:04:05 MST"))
 
 	year := strconv.Itoa(reservationTimeNYC.Year())
 	monthInt := int(reservationTimeNYC.Month())
@@ -560,8 +561,6 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 	day := fmt.Sprintf("%02d", dayInt)
 
 	date := year + "-" + month + "-" + day
-	fmt.Printf("Formatted date: %s\n", date)
-	fmt.Printf("Using venue_id: %d\n", params.VenueID)
 
 	// Use JSON body for find request (Resy API expects application/json)
 	requestBody := map[string]interface{}{
@@ -573,22 +572,17 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 	}
 	bodyBytes, err := json.Marshal(requestBody)
 	if err != nil {
-		fmt.Printf("Error marshaling find request body: %v\n", err)
 		return nil, err
 	}
-	fmt.Printf("Find request body: %s\n", string(bodyBytes))
 
 	findUrl := "https://api.resy.com/4/find"
-	fmt.Printf("Find URL: %s\n", findUrl)
 
 	request, err := http.NewRequest("POST", findUrl, bytes.NewBuffer(bodyBytes))
 	if err != nil {
-		fmt.Printf("Error creating find request: %v\n", err)
 		return nil, err
 	}
 
 	// Setting headers - Important: User-Agent needed to bypass Imperva WAF
-	fmt.Println("Setting headers for find request")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", `ResyAPI api_key="`+a.APIKey+`"`)
 	request.Header.Set("X-Resy-Auth-Token", params.LoginResp.AuthToken)
@@ -604,145 +598,58 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 		request.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	}
 
-	// POST Variations (uncomment to try if GET fails):
-	//
-	// Option A: POST with auth token in body (form-encoded)
-	// bodyStr := fmt.Sprintf("day=%s&venue_id=%d&party_size=%d&x-resy-auth-token=%s",
-	//     url.QueryEscape(date), params.VenueID, params.PartySize, url.QueryEscape(params.LoginResp.AuthToken))
-	// request, err = http.NewRequest("POST", "https://api.resy.com/4/find", bytes.NewBuffer([]byte(bodyStr)))
-	// request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	//
-	// Option B: POST with JSON body
-	// requestBody := map[string]interface{}{
-	//     "day": date,
-	//     "venue_id": params.VenueID,
-	//     "party_size": params.PartySize,
-	//     "x-resy-auth-token": params.LoginResp.AuthToken,
-	// }
-	// jsonBody, _ := json.Marshal(requestBody)
-	// request, err = http.NewRequest("POST", "https://api.resy.com/4/find", bytes.NewBuffer(jsonBody))
-	// request.Header.Set("Content-Type", "application/json")
-	//
-	// Option C: Add User-Agent header (as book endpoint uses)
-	// request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	//
-	// Option D: Try X-Resy-Universal-Auth instead of X-Resy-Universal-Auth-Token (as book endpoint uses)
-	// request.Header.Set("X-Resy-Universal-Auth", params.LoginResp.AuthToken)
-	// Remove or comment out: request.Header.Set("X-Resy-Universal-Auth-Token", ...)
-
-	// Enhanced debugging: Print all request details
-	fmt.Println("=== REQUEST DEBUG INFO ===")
-	fmt.Printf("Method: %s\n", request.Method)
-	fmt.Printf("URL: %s\n", request.URL.String())
-	fmt.Println("Headers:")
-	for key, values := range request.Header {
-		for _, value := range values {
-			// Mask auth token in logs for security
-			if strings.Contains(key, "Auth") {
-				fmt.Printf("  %s: %s\n", key, "***REDACTED***")
-			} else {
-				fmt.Printf("  %s: %s\n", key, value)
-			}
-		}
-	}
-	fmt.Println("==========================")
-
-	client := &http.Client{}
-	fmt.Println("Sending find request")
+	client := &http.Client{Timeout: 12 * time.Second}
 
 	// Use retry logic for Imperva challenges (pass bodyBytes to recreate request on retry, and venueID for fallback)
 	response, err := a.doRequestWithRetry(client, request, bodyBytes, 2, params.VenueID)
 	if err != nil {
-		fmt.Printf("Error sending find request: %v\n", err)
 		return nil, err
 	}
-	fmt.Printf("Received find response with status code: %d\n", response.StatusCode)
-
-	// Enhanced debugging: Print response headers
-	fmt.Println("=== RESPONSE DEBUG INFO ===")
-	fmt.Printf("Status Code: %d\n", response.StatusCode)
-	fmt.Println("Response Headers:")
-	for key, values := range response.Header {
-		for _, value := range values {
-			fmt.Printf("  %s: %s\n", key, value)
-		}
-	}
-	fmt.Println("===========================")
 
 	defer response.Body.Close()
 
 	// Always read the response body, even on error, to see what the API says
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		fmt.Printf("Error reading find response body: %v\n", err)
 		return nil, err
 	}
-	fmt.Printf("Find response body: %s\n", string(responseBody))
 
 	if isCodeFail(response.StatusCode) {
-		fmt.Printf("Find request failed with status code: %d\n", response.StatusCode)
-		fmt.Printf("Error details: %s\n", string(responseBody))
-
-		// Enhanced error parsing: Try to extract detailed error information
-		errorMsg := string(responseBody)
+		errorMsg := truncateForLog(responseBody, 200)
 		var errorMap map[string]interface{}
 		if json.Unmarshal(responseBody, &errorMap) == nil {
-			fmt.Println("=== PARSED ERROR DETAILS ===")
-			for key, value := range errorMap {
-				fmt.Printf("  %s: %v\n", key, value)
-			}
-			fmt.Println("============================")
-
 			if message, ok := errorMap["message"].(string); ok {
-				fmt.Printf("API error message: %s\n", message)
 				errorMsg = message
 			}
-			if errorType, ok := errorMap["type"].(string); ok {
-				fmt.Printf("API error type: %s\n", errorType)
-			}
-			if errors, ok := errorMap["errors"].(map[string]interface{}); ok {
-				fmt.Printf("API errors object: %v\n", errors)
-			}
-		} else {
-			// If not JSON, print raw response
-			fmt.Printf("Response is not JSON, raw content: %s\n", string(responseBody))
 		}
-
 		return nil, api.NewNetworkError("find", response.StatusCode, errorMsg)
 	}
 
 	var jsonTopLevelMap map[string]interface{}
 	err = json.Unmarshal(responseBody, &jsonTopLevelMap)
 	if err != nil {
-		fmt.Printf("Error unmarshaling find response JSON: %v\n", err)
 		return nil, err
 	}
 
-	// Navigate JSON structure
-	fmt.Println("Parsing JSON response for venues and slots")
 	jsonResultsMap, ok := jsonTopLevelMap["results"].(map[string]interface{})
 	if !ok {
-		fmt.Println("Error: 'results' key not found or invalid in JSON response")
 		return nil, api.NewNetworkError("find", 0, "invalid response: 'results' key not found")
 	}
 
 	jsonVenuesList, ok := jsonResultsMap["venues"].([]interface{})
 	if !ok {
-		fmt.Println("Error: 'venues' key not found or invalid in JSON response")
 		return nil, api.NewNetworkError("find", 0, "invalid response: 'venues' key not found")
 	}
 
 	if len(jsonVenuesList) == 0 {
-		fmt.Println("No venues found in the response")
 		return nil, api.ErrNoOffer
 	}
 
 	// Find the venue that matches the requested venue ID
 	var jsonVenueMap map[string]interface{}
-	for i, v := range jsonVenuesList {
+	for _, v := range jsonVenuesList {
 		venue, ok := v.(map[string]interface{})
 		if !ok {
-			fmt.Printf("Skipping invalid venue structure at index %d\n", i)
 			continue
 		}
 
@@ -751,9 +658,7 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 		if venueInfo, ok := venue["venue"].(map[string]interface{}); ok {
 			if idInfo, ok := venueInfo["id"].(map[string]interface{}); ok {
 				if resyID, ok := idInfo["resy"].(float64); ok {
-					fmt.Printf("Found venue at index %d with ID %d\n", i, int64(resyID))
 					if int64(resyID) == params.VenueID {
-						fmt.Printf("Matched requested venue ID %d\n", params.VenueID)
 						jsonVenueMap = venue
 						break
 					}
@@ -762,24 +667,19 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 		}
 	}
 
-	// If no matching venue found, log warning and fall back to first venue
+	// If no matching venue found, fall back to first venue
 	if jsonVenueMap == nil {
-		fmt.Printf("Warning: Could not find venue matching ID %d in response, using first venue\n", params.VenueID)
 		var ok bool
 		jsonVenueMap, ok = jsonVenuesList[0].(map[string]interface{})
 		if !ok {
-			fmt.Println("Error: Invalid venue structure in JSON response")
 			return nil, api.NewNetworkError("find", 0, "invalid response: venue structure is invalid")
 		}
 	}
 
 	jsonSlotsList, ok := jsonVenueMap["slots"].([]interface{})
 	if !ok {
-		fmt.Println("Error: 'slots' key not found or invalid in venue JSON")
 		return nil, api.NewNetworkError("find", 0, "invalid response: 'slots' key not found in venue")
 	}
-
-	fmt.Printf("Number of slots available: %d\n", len(jsonSlotsList))
 
 	// Iterate over table types and reservation times
 	// If no table types specified, match any slot based on time only
@@ -789,14 +689,10 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 		var currentTableType api.TableType
 		if hasTableTypePreference {
 			currentTableType = params.TableTypes[k]
-			fmt.Printf("Searching for table type: %s\n", currentTableType)
-		} else {
-			fmt.Printf("No table type preference provided. Matching any slot based on time only.\n")
 		}
 
 		for i := 0; i < len(params.ReservationTimes); i++ {
 			currentTime := params.ReservationTimes[i]
-			fmt.Printf("Checking reservation time: %s\n", currentTime.Format("2006-01-02 15:04:00"))
 
 			// First pass: Try to find exact match, then closest match within window
 			var bestSlot map[string]interface{}
@@ -807,39 +703,30 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 			const maxTimeDiff = 30 * time.Minute              // Maximum allowed time difference
 			foundExactMatch := false
 
-			fmt.Printf("Starting slot search for time %s (total slots: %d)\n", currentTime.Format("15:04"), len(jsonSlotsList))
-
 			for j := 0; j < len(jsonSlotsList); j++ {
-				fmt.Printf("Evaluating slot %d\n", j)
 				jsonSlotMap, ok := jsonSlotsList[j].(map[string]interface{})
 				if !ok {
-					fmt.Printf("Error: Invalid slot structure at index %d\n", j)
 					continue
 				}
 
 				jsonDateMap, ok := jsonSlotMap["date"].(map[string]interface{})
 				if !ok {
-					fmt.Printf("Error: 'date' key missing or invalid in slot %d\n", j)
 					continue
 				}
 
 				startRaw, ok := jsonDateMap["start"].(string)
 				if !ok {
-					fmt.Printf("Error: 'start' key missing or invalid in slot %d\n", j)
 					continue
 				}
-				fmt.Printf("Slot start time: %s\n", startRaw)
 
 				startFields := strings.Split(startRaw, " ")
 				if len(startFields) != 2 {
-					fmt.Printf("Error: Unexpected 'start' format in slot %d\n", j)
 					continue
 				}
 
 				dateStr := startFields[0]
 				timeFields := strings.Split(startFields[1], ":")
 				if len(timeFields) != 3 {
-					fmt.Printf("Error: Unexpected time format in slot %d\n", j)
 					continue
 				}
 
@@ -849,25 +736,18 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 				dateTimeStr := dateStr + " " + timeFields[0] + ":" + timeFields[1] + ":00"
 				slotTime, err := time.ParseInLocation("2006-01-02 15:04:05", dateTimeStr, nycLocation)
 				if err != nil {
-					fmt.Printf("Error parsing slot time: %v\n", err)
 					continue
 				}
-				fmt.Printf("Parsed slot time (NYC): %s\n", slotTime.Format("2006-01-02 15:04:05 MST"))
 
 				// Convert currentTime to NYC for comparison
 				currentTimeNYC := currentTime.In(nycLocation)
 
 				// Check if the slot is on the same date as the requested time (in NYC timezone)
-				slotDateStr := slotTime.Format("2006-01-02")
-				currentDateStr := currentTimeNYC.Format("2006-01-02")
 				if slotTime.Year() != currentTimeNYC.Year() ||
 					slotTime.Month() != currentTimeNYC.Month() ||
 					slotTime.Day() != currentTimeNYC.Day() {
-					fmt.Printf("Slot %d date %s doesn't match requested date %s, skipping\n",
-						j, slotDateStr, currentDateStr)
 					continue
 				}
-				fmt.Printf("Slot %d date matches: %s\n", j, slotDateStr)
 
 				// Check if the slot matches the desired time (exact match) using NYC times
 				timeMatches := slotTime.Hour() == currentTimeNYC.Hour() && slotTime.Minute() == currentTimeNYC.Minute()
@@ -875,7 +755,6 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 				// Get config map to check table type
 				jsonConfigMap, ok := jsonSlotMap["config"].(map[string]interface{})
 				if !ok {
-					fmt.Printf("Error: 'config' key missing or invalid in slot %d\n", j)
 					continue
 				}
 
@@ -883,25 +762,16 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 				if hasTableTypePreference {
 					tableType, ok := jsonConfigMap["type"].(string)
 					if !ok {
-						fmt.Printf("Error: 'type' key missing or invalid in config of slot %d\n", j)
 						continue
 					}
-					fmt.Printf("Slot %d table type: %s\n", j, tableType)
 
 					if !strings.Contains(strings.ToLower(tableType), string(currentTableType)) {
-						fmt.Printf("Slot %d table type '%s' doesn't match preference '%s', skipping\n", j, tableType, currentTableType)
 						continue
-					}
-				} else {
-					// Just log the table type for debugging
-					if tableType, ok := jsonConfigMap["type"].(string); ok {
-						fmt.Printf("Slot %d table type: %s (no preference, accepting any)\n", j, tableType)
 					}
 				}
 
 				// If exact time match, use it immediately
 				if timeMatches {
-					fmt.Printf("Found exact match at slot %d for time %s\n", j, currentTimeNYC.Format("15:04"))
 					bestSlot = jsonSlotMap
 					bestSlotIndex = j
 					bestSlotTime = slotTime
@@ -921,7 +791,6 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 					if absTimeDiff < 0 {
 						absTimeDiff = -absTimeDiff // Use absolute value
 					}
-					fmt.Printf("Slot %d time difference from requested: %v (absolute: %v)\n", j, timeDiff, absTimeDiff)
 
 					// Only consider slots within the max time window and that are better than current best
 					if absTimeDiff <= maxTimeDiff && absTimeDiff < bestTimeDiff {
@@ -933,24 +802,8 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 						if ok {
 							bestSlotConfigToken = configToken
 						}
-						fmt.Printf("Found closer slot at index %d (time difference: %v, slot time: %s)\n",
-							j, absTimeDiff, slotTime.Format("15:04"))
 					}
 				}
-			}
-
-			// Summary of slot search
-			fmt.Printf("Slot search complete. Found %d slots total.\n", len(jsonSlotsList))
-			currentTimeNYC := currentTime.In(nycLocation)
-			if bestSlotIndex >= 0 {
-				if foundExactMatch {
-					fmt.Printf("✓ Using exact match at slot %d for time %s NYC\n", bestSlotIndex, currentTimeNYC.Format("15:04"))
-				} else {
-					fmt.Printf("✓ No exact match found. Using closest available slot at %s (requested: %s NYC, difference: %v)\n",
-						bestSlotTime.Format("15:04"), currentTimeNYC.Format("15:04"), bestTimeDiff)
-				}
-			} else {
-				fmt.Printf("✗ No suitable slot found within %v of requested time %s NYC\n", maxTimeDiff, currentTimeNYC.Format("15:04"))
 			}
 
 			// If we found a slot (exact or closest), proceed with booking
@@ -960,18 +813,15 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 				if configToken == "" {
 					jsonConfigMap, ok := bestSlot["config"].(map[string]interface{})
 					if !ok {
-						fmt.Printf("Error: 'config' key missing in best slot\n")
 						continue
 					}
 					configToken, ok = jsonConfigMap["token"].(string)
 					if !ok {
-						fmt.Printf("Error: 'token' key missing in best slot config\n")
 						continue
 					}
 				}
 
 				detailUrl := "https://api.resy.com/3/details"
-				fmt.Printf("Detail URL: %s\n", detailUrl)
 
 				// Prepare the request body
 				requestBody := map[string]string{
@@ -981,23 +831,19 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 					"party_size": strconv.Itoa(params.PartySize), // Convert PartySize (an int) to string
 				}
 				jsonBody, err := json.Marshal(requestBody)
-
 				if err != nil {
-					fmt.Printf("Error marshaling request body: %v\n", err)
 					continue
 				}
-				fmt.Printf("Request Body: %s\n", string(jsonBody)) // Add this line
 
 				requestDetail, err := http.NewRequest("POST", detailUrl, bytes.NewBuffer(jsonBody))
 				if err != nil {
-					fmt.Printf("Error creating detail request: %v\n", err)
 					continue
 				}
 
 				// Setting headers for detail request
 				// Set the appropriate headers
 				requestDetail.Header.Set("Content-Type", "application/json")
-				requestDetail.Header.Set("Authorization", "ResyAPI api_key=\"VbWk7s3L4KiK5fzlO7JD3Q5EYolJI7n5\"")
+				requestDetail.Header.Set("Authorization", `ResyAPI api_key="`+a.APIKey+`"`)
 
 				// Add Imperva cookies and user agent
 				a.addCookiesToRequest(requestDetail)
@@ -1006,80 +852,50 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 				if a.UserAgent == "" {
 					requestDetail.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 				}
-				// Log the request headers
-				fmt.Println("Request Headers:")
-				for key, value := range requestDetail.Header {
-					fmt.Printf("%s: %s\n", key, strings.Join(value, ", "))
-				}
 
-				fmt.Println("Sending detail request")
-				responseDetail, err := client.Do(requestDetail)
-				print(responseDetail)
+				responseDetail, err := a.doRequestWithRetry(client, requestDetail, jsonBody, 2, params.VenueID)
 				if err != nil {
-					fmt.Printf("Error sending detail request: %v\n", err)
-					continue
+					return nil, err
 				}
-				fmt.Printf("Received detail response with status code: %d\n", responseDetail.StatusCode)
-
-				if isCodeFail(responseDetail.StatusCode) {
-					responseDetailBody, err := io.ReadAll(responseDetail.Body)
-					if err != nil {
-						fmt.Printf("Error reading detail response body: %v\n", err)
-						continue
-					}
-					fmt.Printf("Detail response body: %s\n", string(responseDetailBody))
-					fmt.Printf("Detail request failed with status code: %d\n", responseDetail.StatusCode)
-					return nil, api.NewNetworkError("detail", responseDetail.StatusCode, string(responseDetailBody))
-				}
-
-				defer responseDetail.Body.Close()
 
 				responseDetailBody, err := io.ReadAll(responseDetail.Body)
-				fmt.Printf("Detail response body: %s\n", string(responseDetailBody))
+				responseDetail.Body.Close()
 				if err != nil {
-					fmt.Printf("Error reading detail response body: %v\n", err)
-					continue
+					return nil, err
 				}
-				fmt.Printf("Detail response body: %s\n", string(responseDetailBody))
+
+				if isCodeFail(responseDetail.StatusCode) {
+					return nil, api.NewNetworkError("detail", responseDetail.StatusCode, truncateForLog(responseDetailBody, 200))
+				}
 
 				var detailTopLevelMap map[string]interface{}
 				err = json.Unmarshal(responseDetailBody, &detailTopLevelMap)
 				if err != nil {
-					fmt.Printf("Error unmarshaling detail response JSON: %v\n", err)
 					return nil, err
 				}
 
 				jsonBookTokenMap, ok := detailTopLevelMap["book_token"].(map[string]interface{})
 				if !ok {
-					fmt.Println("Error: 'book_token' key missing or invalid in detail JSON")
 					continue
 				}
 
 				bookToken, ok := jsonBookTokenMap["value"].(string)
 				if !ok {
-					fmt.Println("Error: 'value' key missing or invalid in 'book_token'")
 					continue
 				}
-				fmt.Printf("Obtained book token: %s\n", bookToken)
 
 				// Proceed to booking step
 				bookUrl := "https://api.resy.com/3/book"
-				fmt.Printf("Book URL: %s\n", bookUrl)
 
 				bookField := "book_token=" + url.QueryEscape(bookToken)
 				paymentMethodStr := `{"id":` + strconv.FormatInt(params.LoginResp.PaymentMethodID, 10) + `}`
 				paymentMethodField := "struct_payment_method=" + url.QueryEscape(paymentMethodStr)
 				requestBookBodyStr := bookField + "&" + paymentMethodField + "&" + "source_id=resy.com-venue-details"
-				fmt.Printf("Book request body: %s\n", requestBookBodyStr)
 
 				requestBook, err := http.NewRequest("POST", bookUrl, bytes.NewBuffer([]byte(requestBookBodyStr)))
 				if err != nil {
-					fmt.Printf("Error creating book request: %v\n", err)
 					continue
 				}
-
-				// Setting headers for book request
-				fmt.Println("Setting headers for book request")
 				requestBook.Header.Set("Authorization", `ResyAPI api_key="`+a.APIKey+`"`)
 				requestBook.Header.Set("Content-Type", `application/x-www-form-urlencoded`)
 				requestBook.Header.Set("Host", `api.resy.com`)
@@ -1095,59 +911,43 @@ func (a *API) Reserve(params api.ReserveParam) (*api.ReserveResponse, error) {
 					requestBook.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 				}
 
-				fmt.Println("Sending book request")
-				responseBook, err := client.Do(requestBook)
+				requestBookBytes := []byte(requestBookBodyStr)
+				responseBook, err := a.doRequestWithRetry(client, requestBook, requestBookBytes, 2, params.VenueID)
 				if err != nil {
-					fmt.Printf("Error sending book request: %v\n", err)
-					continue
-				}
-				fmt.Printf("Received book response with status code: %d\n", responseBook.StatusCode)
-
-				if isCodeFail(responseBook.StatusCode) {
-					fmt.Printf("Book request failed with status code: %d\n", responseBook.StatusCode)
-					continue
+					return nil, err
 				}
 
 				responseBookBody, err := io.ReadAll(responseBook.Body)
+				responseBook.Body.Close()
 				if err != nil {
-					fmt.Printf("Error reading book response body: %v\n", err)
+					return nil, err
+				}
+
+				if isCodeFail(responseBook.StatusCode) {
 					continue
 				}
-				fmt.Printf("Book response body: %s\n", string(responseBookBody))
 
 				var bookTopLevelMap map[string]interface{}
 				err = json.Unmarshal(responseBookBody, &bookTopLevelMap)
 				if err != nil {
-					fmt.Printf("Error unmarshaling book response JSON: %v\n", err)
 					continue
 				}
 
 				// Check if booking was successful
 				if _, ok := bookTopLevelMap["reservation_id"]; ok {
-					fmt.Println("Booking confirmed successfully")
 					resp := api.ReserveResponse{
 						ReservationTime: bestSlotTime,
 					}
 					return &resp, nil
 				} else {
-					fmt.Println("Booking response does not contain confirmation")
-					fmt.Printf("Book response JSON: %v\n", bookTopLevelMap)
-					// If booking failed with 402, it might be a payment issue
-					// Try to continue to next slot if available
-					if responseBook.StatusCode == 402 {
-						fmt.Printf("Payment error (402) for slot at %s, will try next available slot if any\n", bestSlotTime.Format("15:04"))
-					}
+					// Booking response missing confirmation, try next slot
 					continue
 				}
-			} else {
-				// No slot found within the time window
-				fmt.Printf("No available slot found within 30 minutes of requested time %s\n", currentTime.Format("15:04"))
 			}
 		}
 	}
 
 	// If no table was found after all iterations
-	fmt.Println("No available tables found for the given parameters")
 	return nil, api.ErrNoTable
 }
 

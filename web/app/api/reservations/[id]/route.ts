@@ -1,11 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
+import { auth } from "@clerk/nextjs/server";
 
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { userId } = await auth();
+
+  if (!userId) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const apiUrl = process.env.API_URL || "http://localhost:8090";
+  const internalToken = process.env.INTERNAL_API_TOKEN;
   const { id } = await params;
+
+  if (!internalToken) {
+    return NextResponse.json(
+      { error: "Server configuration error" },
+      { status: 500 }
+    );
+  }
 
   try {
     const cookieHeader = request.headers.get("cookie");
@@ -14,6 +29,8 @@ export async function DELETE(
       method: "DELETE",
       headers: {
         "Content-Type": "application/json",
+        "X-Clerk-User-Id": userId,
+        "X-Internal-Token": internalToken,
         ...(cookieHeader && { Cookie: cookieHeader }),
       },
     });

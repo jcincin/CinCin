@@ -28,6 +28,15 @@ func FetchCookies(venueID int64) (*CookieData, error) {
 	return FetchCookiesWithRetry(venueID, 3)
 }
 
+// FetchCookiesVenueURL builds a Resy venue URL for cookie fetch/scrape.
+func FetchCookiesVenueURL(venueID int64) string {
+	slug := resolveVenueSlug(venueID)
+	if slug != "" {
+		return fmt.Sprintf("https://resy.com/cities/ny/%s", slug)
+	}
+	return fmt.Sprintf("https://resy.com/cities/ny/venues/%d", venueID)
+}
+
 // FetchCookiesWithRetry attempts to fetch cookies with retry logic for transient failures
 func FetchCookiesWithRetry(venueID int64, maxRetries int) (*CookieData, error) {
 	var lastErr error
@@ -53,7 +62,7 @@ func FetchCookiesWithRetry(venueID int64, maxRetries int) (*CookieData, error) {
 // fetchCookiesOnce performs a single attempt to fetch cookies
 func fetchCookiesOnce(venueID int64) (*CookieData, error) {
 	// Build the venue URL
-	venueURL := fmt.Sprintf("https://resy.com/cities/nyc/venues/%d", venueID)
+	venueURL := FetchCookiesVenueURL(venueID)
 
 	// Create context with timeout - 60s for headless operation
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

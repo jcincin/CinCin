@@ -45,7 +45,10 @@ Set these environment variables:
 | `REDIS_URL` | `localhost:6379` | Redis connection URL |
 | `REDIS_PASSWORD` | *(empty)* | Redis password |
 | `ADMIN_TOKEN` | *(empty)* | Token for admin endpoints |
+| `INTERNAL_API_TOKEN` | *(required)* | Shared token for internal API access |
+| `NEXT_PUBLIC_APP_URL` | `http://localhost:3000` | Web app URL for internal callbacks |
 | `RESY_API_KEY` | Provided default | Resy API key |
+| `RESY_CREDENTIALS_KEY` | *(required)* | 64-char hex key for encrypting Resy credentials |
 | `COOKIE_REFRESH_ENABLED` | `true` | Enable automatic cookie refresh via headless browser |
 | `COOKIE_REFRESH_INTERVAL` | `6h` | How often to check/refresh cookies (e.g., `6h`, `30m`) |
 | `COOKIE_SECRET_KEY` | Random | 64-char hex string for session persistence |
@@ -82,7 +85,9 @@ Navigate to `/reserve` where you can:
 
 ## API Reference
 
-### Public Endpoints
+### API Endpoints
+
+All `/api/*` and `/admin/*` endpoints require `X-Internal-Token` to be set to `INTERNAL_API_TOKEN`.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|

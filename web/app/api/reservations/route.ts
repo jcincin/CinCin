@@ -1,7 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
+import { auth } from "@clerk/nextjs/server";
 
 export async function GET(request: NextRequest) {
+  const { userId } = await auth();
+
+  if (!userId) {
+    return NextResponse.json({ error: "Unauthorized", reservations: [] }, { status: 401 });
+  }
+
   const apiUrl = process.env.API_URL || "http://localhost:8090";
+  const internalToken = process.env.INTERNAL_API_TOKEN;
+
+  if (!internalToken) {
+    return NextResponse.json(
+      { error: "Server configuration error", reservations: [] },
+      { status: 500 }
+    );
+  }
 
   try {
     const cookieHeader = request.headers.get("cookie");
@@ -10,6 +25,8 @@ export async function GET(request: NextRequest) {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
+        "X-Clerk-User-Id": userId,
+        "X-Internal-Token": internalToken,
         ...(cookieHeader && { Cookie: cookieHeader }),
       },
     });

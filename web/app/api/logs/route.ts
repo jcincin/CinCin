@@ -2,12 +2,21 @@ import { NextResponse } from "next/server";
 
 export async function GET() {
   const apiUrl = process.env.API_URL || "http://localhost:8090";
+  const internalToken = process.env.INTERNAL_API_TOKEN;
+
+  if (!internalToken) {
+    return NextResponse.json(
+      { error: "Server configuration error" },
+      { status: 500 }
+    );
+  }
   
   try {
     const response = await fetch(`${apiUrl}/api/logs`, {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
+        "X-Internal-Token": internalToken,
       },
     });
 

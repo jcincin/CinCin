@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -140,10 +142,27 @@ type VenueStatus struct {
 	TTL          string `json:"ttl,omitempty"`
 }
 
+// Resy link request/response types
+type ResyLinkRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type ResyLinkResponse struct {
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type ResyStatusResponse struct {
+	Linked bool   `json:"linked"`
+	Error  string `json:"error,omitempty"`
+}
+
 var s *securecookie.SecureCookie
 
 // In-memory log lines
 var logLines []string
+var logMu sync.Mutex
 
 // NYC timezone for parsing user input times
 var nycLocation *time.Location
@@ -220,7 +239,7 @@ func main() {
 	})
 
 	// Admin endpoints - protected by ADMIN_TOKEN
-	http.HandleFunc("/admin/cookies/import", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/admin/cookies/import", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -267,9 +286,9 @@ func main() {
 
 		appendLog("Imported " + strconv.Itoa(len(httpCookies)) + " cookies for venue " + strconv.FormatInt(req.VenueID, 10))
 		sendJSONResponse(w, map[string]string{"message": "Cookies imported successfully"}, http.StatusOK)
-	})
+	}, cfg))
 
-	http.HandleFunc("/admin/cookies/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/admin/cookies/", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if !validateAdminToken(r, cfg) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -320,9 +339,9 @@ func main() {
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
+	}, cfg))
 
-	http.HandleFunc("/admin/status", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/admin/status", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -363,10 +382,10 @@ func main() {
 			Venues:              venues,
 			PendingReservations: pendingCount,
 		}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Search API endpoint
-	http.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/search", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -394,10 +413,10 @@ func main() {
 		}
 
 		sendJSONResponse(w, SearchResponse{Results: results.Results}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Select Venue API endpoint
-	http.HandleFunc("/api/select-venue", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/select-venue", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -427,15 +446,15 @@ func main() {
 			Value:    encoded,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   true,
+			Secure:   isSecureRequest(r),
 		}
 		http.SetCookie(w, cookie)
 
 		sendJSONResponse(w, SelectVenueResponse{Message: "Venue selected successfully"}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Login API endpoint
-	http.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/login", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -484,17 +503,17 @@ func main() {
 			Value:    encoded,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   true,
+			Secure:   isSecureRequest(r),
 		}
 		http.SetCookie(w, cookie)
 
 		sendJSONResponse(w, LoginResponse{
 			AuthToken: loginResp.AuthToken,
 		}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Reserve API endpoint
-	http.HandleFunc("/api/reserve", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/reserve", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -506,36 +525,63 @@ func main() {
 			return
 		}
 
-		session, err := getSession(r)
-		if err != nil {
-			sendJSONResponse(w, ReserveResponse{Error: "Unauthorized. Please log in."}, http.StatusUnauthorized)
-			return
-		}
-
-		authToken, ok := session["auth_token"]
-		if !ok || authToken == "" {
-			sendJSONResponse(w, ReserveResponse{Error: "Authentication token missing. Please log in."}, http.StatusUnauthorized)
-			return
-		}
-
-		// Get payment method ID from session
+		var authToken string
 		var paymentMethodID int64
-		if pmIDStr, ok := session["payment_method_id"]; ok && pmIDStr != "" {
-			paymentMethodID, _ = strconv.ParseInt(pmIDStr, 10, 64)
+		var clerkUserID string
+		var session map[string]string
+
+		// Check for Clerk user ID header (new auth flow)
+		clerkUserID = r.Header.Get("X-Clerk-User-Id")
+		if clerkUserID != "" {
+			// Fetch Resy credentials from Redis
+			ctx := context.Background()
+			creds, err := store.GetResyCredentials(ctx, clerkUserID)
+			if err != nil {
+				sendJSONResponse(w, ReserveResponse{Error: "Resy account not linked. Please link your Resy account first."}, http.StatusUnauthorized)
+				return
+			}
+			authToken = creds.AuthToken
+			paymentMethodID = creds.PaymentMethodID
+		} else {
+			// Fallback to session-based auth (legacy flow)
+			var err error
+			session, err = getSession(r)
+			if err != nil {
+				sendJSONResponse(w, ReserveResponse{Error: "Unauthorized. Please log in."}, http.StatusUnauthorized)
+				return
+			}
+
+			var ok bool
+			authToken, ok = session["auth_token"]
+			if !ok || authToken == "" {
+				sendJSONResponse(w, ReserveResponse{Error: "Authentication token missing. Please log in."}, http.StatusUnauthorized)
+				return
+			}
+
+			// Get payment method ID from session
+			if pmIDStr, ok := session["payment_method_id"]; ok && pmIDStr != "" {
+				paymentMethodID, _ = strconv.ParseInt(pmIDStr, 10, 64)
+			}
 		}
 
 		venueID := reserveReq.VenueID
 		if venueID == 0 {
+			// Only try session lookup for legacy flow (non-Clerk users)
+			if session == nil {
+				sendJSONResponse(w, ReserveResponse{Error: "Venue ID missing. Please select a restaurant."}, http.StatusBadRequest)
+				return
+			}
 			venueIDStr, ok := session["venue_id"]
 			if !ok || venueIDStr == "" {
 				sendJSONResponse(w, ReserveResponse{Error: "Venue ID missing. Please select a restaurant first."}, http.StatusBadRequest)
 				return
 			}
-			venueID, err = strconv.ParseInt(venueIDStr, 10, 64)
+			parsedVenueID, err := strconv.ParseInt(venueIDStr, 10, 64)
 			if err != nil {
 				sendJSONResponse(w, ReserveResponse{Error: "Invalid Venue ID"}, http.StatusBadRequest)
 				return
 			}
+			venueID = parsedVenueID
 		}
 
 		// Parse the reservation time (NYC timezone, converted to UTC)
@@ -626,6 +672,11 @@ func main() {
 			ctx := context.Background()
 			resID := store.GenerateReservationID()
 
+			usageType := "immediate"
+			if reserveReq.AutoSchedule {
+				usageType = "concierge"
+			}
+
 			scheduledRes := &store.ScheduledReservation{
 				ID:               resID,
 				VenueID:          venueID,
@@ -633,6 +684,9 @@ func main() {
 				PartySize:        reserveReq.PartySize,
 				TablePreferences: reserveReq.TablePreferences,
 				AuthToken:        authToken,
+				PaymentMethodID:  paymentMethodID,
+				ClerkUserID:      clerkUserID,
+				UsageType:        usageType,
 				RunTime:          requestTime,
 				CreatedAt:        time.Now().UTC(),
 			}
@@ -649,10 +703,10 @@ func main() {
 				ScheduledFor:  requestTime.In(nycLocation).Format("2006-01-02 3:04 PM EST"),
 			}, http.StatusOK)
 		}
-	})
+	}, cfg))
 
 	// Booking window endpoint - get or scrape booking window for a venue
-	http.HandleFunc("/api/booking-window/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/booking-window/", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -685,17 +739,29 @@ func main() {
 			ReleaseTime:   fmt.Sprintf("%02d:%02d", bw.ReleaseHour, bw.ReleaseMinute),
 			Timezone:      bw.Timezone,
 		}, http.StatusOK)
-	})
+	}, cfg))
 
 	// List all scheduled reservations
-	http.HandleFunc("/api/reservations", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/reservations", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		ctx := context.Background()
-		reservations, err := store.GetAllPendingReservations(ctx)
+		clerkUserID := r.Header.Get("X-Clerk-User-Id")
+
+		var reservations []*store.ScheduledReservation
+		var err error
+
+		if clerkUserID != "" {
+			// Filter by Clerk user ID
+			reservations, err = store.GetReservationsByClerkUser(ctx, clerkUserID)
+		} else {
+			// Return all (legacy behavior for admin/testing)
+			reservations, err = store.GetAllPendingReservations(ctx)
+		}
+
 		if err != nil {
 			sendJSONResponse(w, ReservationListResponse{Error: "Failed to fetch reservations"}, http.StatusInternalServerError)
 			return
@@ -716,10 +782,10 @@ func main() {
 		}
 
 		sendJSONResponse(w, ReservationListResponse{Reservations: summaries}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Cancel a scheduled reservation
-	http.HandleFunc("/api/reservations/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/reservations/", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -734,10 +800,17 @@ func main() {
 		resID := path
 
 		ctx := context.Background()
+		clerkUserID := r.Header.Get("X-Clerk-User-Id")
 
 		// Check if reservation exists
-		_, err := store.GetReservation(ctx, resID)
+		res, err := store.GetReservation(ctx, resID)
 		if err != nil {
+			sendJSONResponse(w, CancelReservationResponse{Error: "Reservation not found"}, http.StatusNotFound)
+			return
+		}
+
+		// Verify ownership if Clerk user ID is provided
+		if clerkUserID != "" && res.ClerkUserID != clerkUserID {
 			sendJSONResponse(w, CancelReservationResponse{Error: "Reservation not found"}, http.StatusNotFound)
 			return
 		}
@@ -750,20 +823,129 @@ func main() {
 
 		appendLog("Cancelled reservation: " + resID)
 		sendJSONResponse(w, CancelReservationResponse{Message: "Reservation cancelled"}, http.StatusOK)
-	})
+	}, cfg))
 
 	// Logs endpoint
-	http.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/logs", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(logLines)
-	})
+		logMu.Lock()
+		lines := make([]string, len(logLines))
+		copy(lines, logLines)
+		logMu.Unlock()
+		json.NewEncoder(w).Encode(lines)
+	}, cfg))
+
+	// Resy Link endpoint - link a Resy account to a Clerk user
+	http.HandleFunc("/api/resy/link", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		clerkUserID := r.Header.Get("X-Clerk-User-Id")
+		if clerkUserID == "" {
+			sendJSONResponse(w, ResyLinkResponse{Error: "Unauthorized"}, http.StatusUnauthorized)
+			return
+		}
+
+		var linkReq ResyLinkRequest
+		if err := json.NewDecoder(r.Body).Decode(&linkReq); err != nil {
+			sendJSONResponse(w, ResyLinkResponse{Error: "Invalid request format"}, http.StatusBadRequest)
+			return
+		}
+
+		// Authenticate with Resy
+		loginParam := api.LoginParam{
+			Email:    linkReq.Email,
+			Password: linkReq.Password,
+		}
+
+		loginResp, err := appCtx.API.Login(loginParam)
+		if err != nil {
+			switch err {
+			case api.ErrLoginWrong:
+				sendJSONResponse(w, ResyLinkResponse{Error: "Incorrect Resy email or password"}, http.StatusUnauthorized)
+			case api.ErrNetwork:
+				sendJSONResponse(w, ResyLinkResponse{Error: "Network error. Please try again later."}, http.StatusInternalServerError)
+			case api.ErrNoPayInfo:
+				sendJSONResponse(w, ResyLinkResponse{Error: "No payment information found on your Resy account."}, http.StatusBadRequest)
+			default:
+				sendJSONResponse(w, ResyLinkResponse{Error: "Failed to authenticate with Resy"}, http.StatusInternalServerError)
+			}
+			return
+		}
+
+		// Save credentials to Redis
+		ctx := context.Background()
+		creds := &store.ResyCredentials{
+			ClerkUserID:     clerkUserID,
+			AuthToken:       loginResp.AuthToken,
+			PaymentMethodID: loginResp.PaymentMethodID,
+		}
+
+		if err := store.SaveResyCredentials(ctx, creds); err != nil {
+			appendLog("Failed to save Resy credentials for user " + clerkUserID + ": " + err.Error())
+			sendJSONResponse(w, ResyLinkResponse{Error: "Failed to save credentials"}, http.StatusInternalServerError)
+			return
+		}
+
+		appendLog("Linked Resy account for Clerk user " + clerkUserID)
+		sendJSONResponse(w, ResyLinkResponse{Message: "Resy account linked successfully"}, http.StatusOK)
+	}, cfg))
+
+	// Resy Status endpoint - check if a Clerk user has linked their Resy account
+	http.HandleFunc("/api/resy/status", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		clerkUserID := r.Header.Get("X-Clerk-User-Id")
+		if clerkUserID == "" {
+			sendJSONResponse(w, ResyStatusResponse{Error: "Unauthorized"}, http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.Background()
+		exists, err := store.ResyCredentialsExist(ctx, clerkUserID)
+		if err != nil {
+			sendJSONResponse(w, ResyStatusResponse{Error: "Failed to check status"}, http.StatusInternalServerError)
+			return
+		}
+
+		sendJSONResponse(w, ResyStatusResponse{Linked: exists}, http.StatusOK)
+	}, cfg))
+
+	// Resy Unlink endpoint - remove linked Resy account
+	http.HandleFunc("/api/resy/unlink", requireInternalToken(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		clerkUserID := r.Header.Get("X-Clerk-User-Id")
+		if clerkUserID == "" {
+			sendJSONResponse(w, ResyLinkResponse{Error: "Unauthorized"}, http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.Background()
+		if err := store.DeleteResyCredentials(ctx, clerkUserID); err != nil {
+			appendLog("Failed to unlink Resy account for user " + clerkUserID + ": " + err.Error())
+			sendJSONResponse(w, ResyLinkResponse{Error: "Failed to unlink account"}, http.StatusInternalServerError)
+			return
+		}
+
+		appendLog("Unlinked Resy account for Clerk user " + clerkUserID)
+		sendJSONResponse(w, ResyLinkResponse{Message: "Resy account unlinked successfully"}, http.StatusOK)
+	}, cfg))
 
 	// Create cancellable context for scheduler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Start the scheduling goroutine (Redis-backed)
-	go handleScheduledReservations(ctx, appCtx)
+	go handleScheduledReservations(ctx, appCtx, cfg)
 
 	// Start the cookie refresh goroutine (if enabled)
 	if cfg.CookieRefreshEnabled {
@@ -798,7 +980,7 @@ func main() {
 	appendLog("Server stopped")
 }
 
-func handleScheduledReservations(ctx context.Context, appCtx app.AppCtx) {
+func handleScheduledReservations(ctx context.Context, appCtx app.AppCtx, cfg *config.Config) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -838,6 +1020,22 @@ func handleScheduledReservations(ctx context.Context, appCtx app.AppCtx) {
 			// Time to attempt booking
 			appendLog("Attempting scheduled reservation " + nextRes.ID + " for venue " + strconv.FormatInt(nextRes.VenueID, 10))
 
+			// Get auth credentials - refresh from Redis if Clerk user
+			authToken := nextRes.AuthToken
+			paymentMethodID := nextRes.PaymentMethodID
+			if nextRes.ClerkUserID != "" {
+				// Fetch fresh credentials from Redis for Clerk users
+				creds, err := store.GetResyCredentials(ctx, nextRes.ClerkUserID)
+				if err != nil {
+					appendLog("Failed to get Resy credentials for user " + nextRes.ClerkUserID + ": " + err.Error())
+					// Delete the reservation since we can't execute it
+					store.DeleteReservation(ctx, nextRes.ID)
+					continue
+				}
+				authToken = creds.AuthToken
+				paymentMethodID = creds.PaymentMethodID
+			}
+
 			// Convert table preferences
 			var tableTypes []api.TableType
 			for _, pref := range nextRes.TablePreferences {
@@ -848,7 +1046,7 @@ func handleScheduledReservations(ctx context.Context, appCtx app.AppCtx) {
 				VenueID:          nextRes.VenueID,
 				ReservationTimes: []time.Time{nextRes.ReservationTime},
 				PartySize:        nextRes.PartySize,
-				LoginResp:        api.LoginResponse{AuthToken: nextRes.AuthToken},
+				LoginResp:        api.LoginResponse{AuthToken: authToken, PaymentMethodID: paymentMethodID},
 				TableTypes:       tableTypes,
 			}
 
@@ -857,6 +1055,7 @@ func handleScheduledReservations(ctx context.Context, appCtx app.AppCtx) {
 				appendLog("Failed to book scheduled reservation " + nextRes.ID + ": " + err.Error())
 			} else {
 				appendLog("Successfully booked scheduled reservation " + nextRes.ID)
+				notifyUsageIncrement(ctx, cfg, nextRes)
 			}
 
 			// Remove the reservation from Redis (regardless of success/failure)
@@ -952,28 +1151,107 @@ func refreshCookiesIfNeeded(ctx context.Context, venueID int64) {
 	appendLog("Successfully refreshed " + strconv.Itoa(len(cookieData.Cookies)) + " cookies for venue " + venueIDStr)
 }
 
+// requireInternalToken validates the internal token for API/admin endpoints
+func requireInternalToken(next http.HandlerFunc, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cfg.InternalAPIToken == "" {
+			http.Error(w, "Server configuration error", http.StatusInternalServerError)
+			return
+		}
+		token := r.Header.Get("X-Internal-Token")
+		if token == "" || token != cfg.InternalAPIToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func notifyUsageIncrement(ctx context.Context, cfg *config.Config, res *store.ScheduledReservation) {
+	if res.ClerkUserID == "" {
+		return
+	}
+	if cfg.InternalAPIToken == "" {
+		appendLog("Usage increment skipped: INTERNAL_API_TOKEN not configured")
+		return
+	}
+	if cfg.WebAppURL == "" {
+		appendLog("Usage increment skipped: web app URL not configured")
+		return
+	}
+
+	usageType := res.UsageType
+	if usageType == "" {
+		usageType = "immediate"
+	}
+
+	payload := map[string]string{
+		"clerkUserId": res.ClerkUserID,
+		"type":        usageType,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		appendLog("Usage increment failed to marshal payload: " + err.Error())
+		return
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	url := strings.TrimRight(cfg.WebAppURL, "/") + "/api/internal/usage"
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		appendLog("Usage increment request failed: " + err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Token", cfg.InternalAPIToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		appendLog("Usage increment request error: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		appendLog("Usage increment request failed with status " + strconv.Itoa(resp.StatusCode))
+	}
+}
+
 // validateAdminToken checks the Authorization header for a valid admin token
 func validateAdminToken(r *http.Request, cfg *config.Config) bool {
-	if !cfg.HasAdminToken() {
-		// If no admin token is configured, check for a query param (for development)
-		token := r.URL.Query().Get("token")
-		return token != "" && cfg.ValidateAdminToken(token)
-	}
-
+	queryToken := r.URL.Query().Get("token")
 	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		// Also check query param as fallback
-		token := r.URL.Query().Get("token")
-		return cfg.ValidateAdminToken(token)
+
+	if cfg.HasAdminToken() {
+		if authHeader == "" {
+			return cfg.ValidateAdminToken(queryToken)
+		}
+
+		// Expect "Bearer <token>"
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			return false
+		}
+
+		return cfg.ValidateAdminToken(parts[1])
 	}
 
-	// Expect "Bearer <token>"
-	parts := strings.SplitN(authHeader, " ", 2)
-	if len(parts) != 2 || parts[0] != "Bearer" {
-		return false
+	if cfg.HasDevAdminToken() {
+		if authHeader == "" {
+			return cfg.ValidateDevAdminToken(queryToken)
+		}
+
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			return false
+		}
+
+		return cfg.ValidateDevAdminToken(parts[1])
 	}
 
-	return cfg.ValidateAdminToken(parts[1])
+	return false
 }
 
 // Helper function to send JSON responses
@@ -981,6 +1259,14 @@ func sendJSONResponse(w http.ResponseWriter, response interface{}, statusCode in
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(response)
+}
+
+func isSecureRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	forwardedProto := r.Header.Get("X-Forwarded-Proto")
+	return strings.EqualFold(forwardedProto, "https")
 }
 
 func getCookieValue(r *http.Request, name string) (string, error) {
@@ -1019,6 +1305,8 @@ func parseTimeNYC(timeStr string) (time.Time, error) {
 
 // appendLog adds a log message to both the standard log and in-memory slice
 func appendLog(message string) {
+	logMu.Lock()
+	defer logMu.Unlock()
 	// Prevent unbounded memory growth by trimming old entries
 	if len(logLines) >= maxLogLines {
 		logLines = logLines[1:] // Remove oldest entry
